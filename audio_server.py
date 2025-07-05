@@ -453,6 +453,16 @@ async def get_interface():
                 <div class="file-info" id="file-info" style="display: none;"></div>
             </div>
             
+            <div class="form-group">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="enhancedOutput">
+                    <label for="enhancedOutput">📈 Enhanced Output (matches web app playback quality)</label>
+                </div>
+                <div style="font-size: 14px; opacity: 0.8; margin-top: 5px;">
+                    Creates a version that sounds like the web player with volume boost and EQ applied
+                </div>
+            </div>
+            
             <button class="process-button" id="processBtn" onclick="processAudio()" disabled>
                 🔄 Process Audio
             </button>
@@ -598,6 +608,7 @@ async def get_interface():
                 const formData = new FormData();
                 formData.append('file', file);
                 formData.append('preset', selectedPreset);
+                formData.append('enhanced_output', document.getElementById('enhancedOutput').checked);
                 
                 try {
                     updateProgress(20, 'Processing audio...');
@@ -669,14 +680,16 @@ async def get_interface():
 @app.post("/process")
 async def process_audio(
     file: UploadFile = File(...),
-    preset: str = Form("whisper")
+    preset: str = Form("whisper"),
+    enhanced_output: bool = Form(False)
 ):
-    """Process uploaded audio file"""
+    """Process uploaded audio file with optional enhanced output"""
     
     # Create unique temp files
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     input_path = TEMP_DIR / f"input_{timestamp}_{file.filename}"
     output_path = TEMP_DIR / f"output_{timestamp}.wav"
+    enhanced_path = TEMP_DIR / f"enhanced_{timestamp}.wav"
     
     try:
         # Save uploaded file
@@ -684,7 +697,7 @@ async def process_audio(
             content = await file.read()
             f.write(content)
         
-        logger.info(f"Processing {file.filename} with preset '{preset}'")
+        logger.info(f"Processing {file.filename} with preset '{preset}', enhanced: {enhanced_output}")
         logger.info(f"Input file size: {input_path.stat().st_size} bytes")
         
         # Check if FFmpeg is available
@@ -702,20 +715,31 @@ async def process_audio(
             logger.error(f"Processing failed: {result['error']}")
             raise HTTPException(status_code=500, detail=result["error"])
         
+        # Create enhanced version if requested
+        final_output_path = output_path
+        if enhanced_output:
+            await create_enhanced_output(output_path, enhanced_path, preset)
+            if enhanced_path.exists():
+                final_output_path = enhanced_path
+        
         # Check if output file exists and has content
-        if not output_path.exists():
+        if not final_output_path.exists():
             raise HTTPException(status_code=500, detail="Output file was not created")
         
-        if output_path.stat().st_size == 0:
+        if final_output_path.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Output file is empty")
         
-        logger.info(f"Processing successful. Output file size: {output_path.stat().st_size} bytes")
+        logger.info(f"Processing successful. Output file size: {final_output_path.stat().st_size} bytes")
+        
+        # Determine filename
+        output_suffix = "_enhanced" if enhanced_output and final_output_path == enhanced_path else "_processed"
+        filename = f"{output_suffix}_{file.filename}"
         
         # Return processed file
         return FileResponse(
-            path=output_path,
+            path=final_output_path,
             media_type="audio/wav",
-            filename=f"processed_{file.filename}"
+            filename=filename
         )
         
     except HTTPException:
@@ -731,6 +755,63 @@ async def process_audio(
                 input_path.unlink()
             except:
                 pass
+
+async def create_enhanced_output(input_path: Path, output_path: Path, preset_name: str):
+    """Create enhanced output that matches web app playback quality"""
+    
+    try:
+        # Enhanced processing chain that matches web app
+        enhanced_filters = []
+        
+        # Base volume boost (matches web app 200% capability)
+        enhanced_filters.append("volume=1.5")  # 150% volume boost
+        
+        # Additional EQ based on preset for web app matching
+        if preset_name == "clean_whisper":
+            enhanced_filters.extend([
+                "equalizer=f=250:t=o:g=2",   # Voice fundamentals
+                "equalizer=f=500:t=o:g=3",   # Voice clarity
+                "equalizer=f=1000:t=o:g=2",  # Mid clarity
+            ])
+        elif preset_name == "tv_suppress":
+            enhanced_filters.extend([
+                "equalizer=f=60:t=o:g=-8",   # Kill low rumble
+                "equalizer=f=500:t=o:g=4",   # Boost voice
+                "equalizer=f=1500:t=o:g=5",  # Voice clarity
+            ])
+        elif preset_name == "whisper":
+            enhanced_filters.extend([
+                "equalizer=f=300:t=o:g=2",   # Voice fundamentals
+                "equalizer=f=1000:t=o:g=3",  # Voice clarity
+            ])
+        
+        # Final touches for web app matching
+        enhanced_filters.extend([
+            "acompressor=threshold=-20dB:ratio=2:attack=10:release=100",  # Gentle compression
+            "alimiter=level_in=1:level_out=0.95:limit=0.95",  # Soft limiting
+        ])
+        
+        # Build enhanced filter chain
+        filter_chain = ",".join(enhanced_filters)
+        
+        # Apply enhanced processing
+        cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-af", filter_chain,
+            "-c:a", "pcm_s16le",
+            "-ar", "44100",
+            "-ac", "2",
+            str(output_path)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logger.error(f"Enhanced processing failed: {result.stderr}")
+            
+    except Exception as e:
+        logger.error(f"Enhanced output creation failed: {str(e)}")
+        # Don't raise exception - just log and continue with regular output
 
 @app.get("/debug")
 async def debug_info():
